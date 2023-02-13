@@ -4,8 +4,11 @@
 *.pptx
 *.txt
 *.pdf
+*.parquet
 
 # Data folder
 data/
 Data/
 
+#IDE specific folders
+.idea/
