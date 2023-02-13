@@ -1,0 +1,11 @@
+# Data files
+*.xlsx
+*.csv
+*.pptx
+*.txt
+*.pdf
+
+# Data folder
+data/
+Data/
+
