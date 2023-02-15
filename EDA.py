@@ -87,10 +87,9 @@ class DataPL:
         if file_path is None:
             file_path = cls.find_file('transaction_data.parquet')
         df = pl.read_parquet(file_path)
-        df = df.with_columns([pl.col('quantity').cast(pl.Int32),
-                              pl.col('client_id').cast(pl.UInt32),
-                              pl.col('product_id').cast(pl.UInt32)])
-        df = df.with_columns([pl.col('branch_id').cast(pl.UInt16)])
+        df = df.with_columns([pl.col(['date_order', 'date_invoice']).str.strptime(datatype=pl.Date),
+                              pl.col(['quantity', 'client_id', 'product_id']).cast(pl.Int32),
+                              pl.col('branch_id').cast(pl.UInt16)])
         return df
 
     @classmethod
@@ -122,17 +121,13 @@ class DataPL:
     def calculate_mean_price(cls, df: pl.DataFrame) -> pl.DataFrame:
         if 'item_price' not in df.columns:
             df = cls.calculate_item_price(df)
-        df_grouped = df.lazy().groupby('product_id').agg(pl.mean('item_price').alias('avg_item_price')).collect()
-        return df.join(df_grouped, on='product_id', how='inner')
+        return df.with_columns([pl.mean('item_price').over('product_id').alias('avg_item_price')])
 
     @classmethod
     def calculate_quantile_price(cls, df: pl.DataFrame, quantile: float = 0.5) -> pl.DataFrame:
         if 'item_price' not in df.columns:
             df = cls.calculate_item_price(df)
-        df_grouped = df.lazy().groupby('product_id').agg(pl.col('item_price')
-                                                         .quantile(quantile)
-                                                         .alias('avg_item_price')).collect()
-        return df.join(df_grouped, on='product_id', how='inner')
+        return df.with_columns([pl.quantile('item_price', quantile).over('product_id').alias('median_item_price')])
 
     @staticmethod
     def calculate_time_delta(df: pl.DataFrame) -> pl.DataFrame:
