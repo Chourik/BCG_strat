@@ -2,9 +2,9 @@
 *.xlsx
 *.csv
 *.pptx
-*.txt
 *.pdf
 *.parquet
+*.docx
 
 # Data folder
 data/
@@ -12,3 +12,4 @@ Data/
 
 #IDE specific folders
 .idea/
+.DS_Store
