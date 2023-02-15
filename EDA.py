@@ -17,6 +17,7 @@ pd.set_option('display.width', 2000)
 
 pl.Config.set_tbl_cols(2000)
 
+
 # # Reading in the data
 # df = pd.read_parquet('transaction_data.parquet')
 # df = pd.merge(df, pd.read_csv('sales_client_relationship_dataset.csv'), on='client_id', how='inner')
@@ -88,7 +89,7 @@ class DataPL:
             file_path = cls.find_file('transaction_data.parquet')
         df = pl.read_parquet(file_path)
         df = df.with_columns([pl.col(['date_order', 'date_invoice']).str.strptime(datatype=pl.Date),
-                              pl.col(['quantity', 'client_id', 'product_id']).cast(pl.Int32),
+                              pl.col(['quantity', 'client_id', 'product_id']).cast(pl.UInt32),
                               pl.col('branch_id').cast(pl.UInt16)])
         return df
 
@@ -121,17 +122,87 @@ class DataPL:
     def calculate_mean_price(cls, df: pl.DataFrame) -> pl.DataFrame:
         if 'item_price' not in df.columns:
             df = cls.calculate_item_price(df)
-        return df.with_columns([pl.mean('item_price').over('product_id').alias('avg_item_price')])
+        return df.with_columns([pl.mean('item_price').over('product_id').alias('mean_item_price')])
 
     @classmethod
-    def calculate_quantile_price(cls, df: pl.DataFrame, quantile: float = 0.5) -> pl.DataFrame:
+    def calculate_quantile_price(cls, df: pl.DataFrame, quantile: float = 0.5,
+                                 col_name: str = 'median_item_price') -> pl.DataFrame:
         if 'item_price' not in df.columns:
             df = cls.calculate_item_price(df)
-        return df.with_columns([pl.quantile('item_price', quantile).over('product_id').alias('median_item_price')])
+        return df.with_columns([pl.quantile('item_price', quantile).over('product_id').alias(col_name)])
 
     @staticmethod
-    def calculate_time_delta(df: pl.DataFrame) -> pl.DataFrame:
-        ...
+    def calculate_mean_order_freq(df: pl.DataFrame) -> pl.DataFrame:
+        """This method calculates how often (on average) a client orders something"""
+        return df.with_columns([((pl.max('date_order') - pl.min('date_order')).dt.days()
+                                 / pl.n_unique('date_order'))
+                               .over('client_id')
+                               .alias('mean_order_freq')])
+
+    @staticmethod
+    def calculate_quantile_order_freq(df: pl.DataFrame, quantile: float = 0.5,
+                                      col_name: str = 'median_order_freq') -> pl.DataFrame:
+        """This method calculates the quantile frequency of a client's orders."""
+        return df.with_columns([pl.col('date_order').unique().sort().diff(1).dt.days().quantile(quantile)
+                               .over('client_id')
+                               .alias(col_name)])
+
+    @staticmethod
+    def calculate_mean_price_unbiased(df: pl.DataFrame) -> pl.DataFrame:
+        return df.with_columns([(pl.sum('sales_net') / pl.sum('quantity'))
+                               .over('product_id')
+                               .alias('unbiased_mean_price')])
+
+    @classmethod
+    def calculate_mean_price_client_specific(cls, df: pl.DataFrame) -> pl.DataFrame:
+        return df.with_columns([(pl.sum('sales_net') / pl.sum('quantity'))
+                               .over(['product_id', 'client_id'])
+                               .alias('unbiased_client_specific_mean_price')])
+
+    @classmethod
+    def calculate_relative_price(cls, df: pl.DataFrame) -> pl.DataFrame:
+        if 'unbiased_mean_price' not in df.columns:
+            df = cls.calculate_mean_price_unbiased(df)
+        return df.with_columns([((pl.col('item_price') - pl.col('unbiased_mean_price'))
+                                 / pl.col('unbiased_mean_price'))
+                               .alias('relative_price')])
+
+    @classmethod
+    def calculate_relative_price_client_specific(cls, df: pl.DataFrame) -> pl.DataFrame:
+        if 'unbiased_client_specific_mean_price' not in df.columns:
+            df = cls.calculate_mean_price_client_specific(df)
+        return df.with_columns([((pl.col('item_price') - pl.col('unbiased_client_specific_mean_price'))
+                                 / pl.col('unbiased_client_specific_mean_price'))
+                               .alias('client_specific_relative_price')])
+
+    @classmethod
+    def add_features(cls, df: pl.DataFrame) -> pl.DataFrame:
+        return df.pipe(cls.calculate_item_price) \
+            .pipe(cls.calculate_mean_price) \
+            .pipe(cls.calculate_quantile_price) \
+            .pipe(cls.calculate_mean_order_freq) \
+            .pipe(cls.calculate_quantile_order_freq) \
+            .pipe(cls.calculate_relative_price) \
+            .pipe(cls.calculate_relative_price_client_specific)
+
+    @classmethod
+    def load_data_for_model(cls) -> pl.DataFrame:
+        df = cls.load_all_data().pipe(cls.add_features())
+        return df.drop(['date_order',
+                        'date_invoice',
+                        'sales_net',
+                        'quantity',
+                        'order_channel',
+                        'quality_relation',
+                        'item_price',
+                        'mean_item_price',
+                        'median_item_price',
+                        'mean_order_freq',
+                        'median_order_freq',
+                        'unbiased_mean_price',
+                        'relative_price',
+                        'unbiased_client_specific_mean_price',
+                        'client_specific_relative_price'])
 
 
 class Analyzer:
@@ -154,3 +225,7 @@ class Analyzer:
         client_group = df.groupby('client_id').sales_net.sum().sort_values(ascending=False)
         index_of_quantile = int(quantile * len(client_group))
         return client_group.iloc[:index_of_quantile].sum() / client_group.sum() * 100
+
+
+df = DataPL.load_all_data()
+df = DataPL.add_features(df)
