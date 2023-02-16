@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from dateutil import parser
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import polars as pl
+import seaborn as sns
 
 from collections import defaultdict
 import os
 import sys
 import time
+from typing import Union
 import warnings
 
 warnings.simplefilter('ignore', FutureWarning)
@@ -16,23 +20,7 @@ pd.set_option('display.max_columns', 20)
 pd.set_option('display.width', 2000)
 
 pl.Config.set_tbl_cols(2000)
-
-
-# # Reading in the data
-# df = pd.read_parquet('transaction_data.parquet')
-# df = pd.merge(df, pd.read_csv('sales_client_relationship_dataset.csv'), on='client_id', how='inner')
-# # Adjusting the data types
-# df.loc[:, ['date_order', 'date_invoice']] = df.loc[:, ['date_order', 'date_invoice']].astype('datetime64')
-# df.loc[:, 'quantity'] = df.loc[:, 'quantity'].astype('int32')
-
-# # Grouping by clients
-# client_group = df.groupby('client_id')['sales_net'].sum().sort_values()
-# # Most clients have positive net sales -> negative net sales can't be us buying from the suppliers
-# (client_group < 0).sum()
-# # 1296 clients have more than 10^6 net sales
-# (client_group > 10**6).sum()
-# # One percent of clients is responsible for 1/3 of the net sales
-# client_group.iloc[-1706:].sum() / client_group.sum()
+pl.Config.set_tbl_rows(10)
 
 
 class Data:
@@ -90,7 +78,8 @@ class DataPL:
         df = pl.read_parquet(file_path)
         df = df.with_columns([pl.col(['date_order', 'date_invoice']).str.strptime(datatype=pl.Date),
                               pl.col(['quantity', 'client_id', 'product_id']).cast(pl.UInt32),
-                              pl.col('branch_id').cast(pl.UInt16)])
+                              pl.col('branch_id').cast(pl.UInt16),
+                              pl.col('order_channel').cast(pl.Categorical)])
         return df
 
     @classmethod
@@ -98,7 +87,8 @@ class DataPL:
         if file_path is None:
             file_path = cls.find_file('sales_client_relationship_dataset.csv')
         df = pl.read_csv(file_path)
-        df = df.with_columns([pl.col('client_id').cast(pl.UInt32)])
+        df = df.with_columns([pl.col('client_id').cast(pl.UInt32),
+                              pl.col('quali_relation').cast(pl.Categorical)])
         return df
 
     @classmethod
@@ -145,7 +135,7 @@ class DataPL:
         """This method calculates the quantile frequency of a client's orders."""
         return df.with_columns([pl.col('date_order').unique().sort().diff(1).dt.days().quantile(quantile)
                                .over('client_id')
-                               .alias(col_name)])
+                               .alias(col_name).cast(pl.UInt16)])
 
     @staticmethod
     def calculate_mean_price_unbiased(df: pl.DataFrame) -> pl.DataFrame:
@@ -176,6 +166,29 @@ class DataPL:
                                .alias('client_specific_relative_price')])
 
     @classmethod
+    def calculate_days_since_last_order(cls, df: pl.DataFrame, ref_date: str = '2019-09-22') -> pl.DataFrame:
+        """This method calculates the number of days between the last order of a client and the ref_date."""
+        return df.with_columns([(parser.parse(ref_date).date() - pl.col('date_order').max()).dt.days().cast(pl.Int16)
+                               .over('client_id')
+                               .alias('days_since_last_order')])
+
+    @staticmethod
+    def calculate_days_with_order(df: pl.DataFrame) -> pl.DataFrame:
+        return df.with_columns([pl.n_unique('date_order').over('client_id').alias('days_with_order').cast(pl.UInt16)])
+
+    @staticmethod
+    def calculate_order_count(df: pl.DataFrame) -> pl.DataFrame:
+        return df.with_columns([pl.count().over('client_id').alias('order_count')])
+
+    @staticmethod
+    def add_churn(df: pl.DataFrame, threshold: float = 1.5) -> pl.DataFrame:
+        """This method creates a column with a value of 1 if the client is assumed to have churned and 0 otherwise.
+        Churn is defined based on the time since the last order and the order frequency."""
+        return df.with_columns(pl.when(pl.col('days_since_last_order') > threshold * pl.col('q100_order_freq'))
+                               .then(1)
+                               .otherwise(0).alias('churned'))
+
+    @classmethod
     def add_features(cls, df: pl.DataFrame) -> pl.DataFrame:
         return df.pipe(cls.calculate_item_price) \
             .pipe(cls.calculate_mean_price) \
@@ -183,7 +196,12 @@ class DataPL:
             .pipe(cls.calculate_mean_order_freq) \
             .pipe(cls.calculate_quantile_order_freq) \
             .pipe(cls.calculate_relative_price) \
-            .pipe(cls.calculate_relative_price_client_specific)
+            .pipe(cls.calculate_relative_price_client_specific) \
+            .pipe(cls.calculate_days_since_last_order) \
+            .pipe(cls.calculate_days_with_order) \
+            .pipe(cls.calculate_order_count) \
+            .pipe(cls.calculate_quantile_order_freq, quantile=1, col_name='q100_order_freq') \
+            .pipe(cls.add_churn, threshold=1.5)
 
     @classmethod
     def load_data_for_model(cls) -> pl.DataFrame:
@@ -227,5 +245,40 @@ class Analyzer:
         return client_group.iloc[:index_of_quantile].sum() / client_group.sum() * 100
 
 
-df = DataPL.load_all_data()
-df = DataPL.add_features(df)
+class Plots:
+    @staticmethod
+    def format_label(label: str, max_len: int = 20) -> str:
+        line = ''
+        lines = []
+        for word in label.split(' '):
+            if len(line) + len(word) <= max_len:
+                line += word + ' '
+            else:
+                lines += [line]
+                line = word + ' '
+        lines += [line.strip()]
+        return '\n'.join(lines)
+
+    @classmethod
+    def hist_plot(cls, df: Union[pd.DataFrame, pl.DataFrame], x: str, y: str, agg_func: str = 'mean',
+                  save: bool = False, file_name: str = None) -> None:
+        """This method creates a histogram with x on the x-axis and y on y-axis, agg_func defines how values should be
+        aggregated if there are multiple y values for an x value."""
+        if type(df) == pl.DataFrame:
+            data = df.groupby(x).agg(eval(f"pl.{agg_func}('{y}')")).to_pandas()
+        elif type(df) == pd.DataFrame:
+            data = df.copy()
+        else:
+            raise TypeError('The df can only be a pandas or a polars DataFrame.')
+
+        plot = sns.barplot(data=data, x=x, y=y, estimator=agg_func)
+        plot.set_xticklabels([cls.format_label(label) for label in data[x]])
+        plt.tight_layout()
+        if save:
+            if file_name is None:
+                file_name = f'barplot_{x}_{y}.jpeg'
+            plot.get_figure().savefig(file_name)
+
+
+# df = DataPL.load_all_data()
+# df = DataPL.add_features(df)
