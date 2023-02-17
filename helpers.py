@@ -6,21 +6,20 @@ import numpy as np
 import pandas as pd
 import polars as pl
 import seaborn as sns
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-from collections import defaultdict
+from rnns import RNN
+
 import os
-import sys
-import time
-from typing import Union
+from typing import Any, Union
 import warnings
 
 warnings.simplefilter('ignore', FutureWarning)
 
-pd.set_option('display.max_columns', 20)
-pd.set_option('display.width', 2000)
-
-pl.Config.set_tbl_cols(2000)
-pl.Config.set_tbl_rows(10)
+# pl.Config.set_tbl_cols(2000)
+# pl.Config.set_tbl_rows(10)
 
 
 class Data:
@@ -101,7 +100,9 @@ class DataPL:
 
     @staticmethod
     def clean_data(df: pl.DataFrame) -> pl.DataFrame:
-        return df.filter((pl.col('sales_net') >= 0) & (pl.col('date_invoice') >= pl.col('date_order')))
+        return df.filter((pl.col('sales_net') > 0)
+                         & (pl.col('date_invoice') >= pl.col('date_order'))
+                         & (pl.col('date_order').n_unique().over('client_id') > 1))
 
     @staticmethod
     def calculate_item_price(df: pl.DataFrame) -> pl.DataFrame:
@@ -186,7 +187,7 @@ class DataPL:
         Churn is defined based on the time since the last order and the order frequency."""
         return df.with_columns(pl.when(pl.col('days_since_last_order') > threshold * pl.col('q100_order_freq'))
                                .then(1)
-                               .otherwise(0).alias('churned'))
+                               .otherwise(0).alias('churned').cast(pl.Int8))
 
     @classmethod
     def add_features(cls, df: pl.DataFrame) -> pl.DataFrame:
@@ -203,24 +204,79 @@ class DataPL:
             .pipe(cls.calculate_quantile_order_freq, quantile=1, col_name='q100_order_freq') \
             .pipe(cls.add_churn, threshold=1.5)
 
+    @staticmethod
+    def normalize(df: pl.DataFrame, columns: list[Union[str, int]]) -> pl.DataFrame:
+        return df.with_columns([pl.col(col) / pl.max(col) for col in columns])
+
+    @staticmethod
+    def one_hot_encode(df: pl.DataFrame, columns: list[Union[str, int]]) -> pl.DataFrame:
+        # index_cols = [col for col in df.columns if col not in columns]
+        # df.with_columns(pl.lit(1).alias('one').cast(pl.Int8)) \
+        #     .pivot(index=index_cols, columns=columns, values='one') \
+        #     .fill_null(0)
+        return df.to_dummies(columns=columns)
+
     @classmethod
-    def load_data_for_model(cls) -> pl.DataFrame:
-        df = cls.load_all_data().pipe(cls.add_features())
-        return df.drop(['date_order',
-                        'date_invoice',
-                        'sales_net',
-                        'quantity',
-                        'order_channel',
-                        'quality_relation',
-                        'item_price',
-                        'mean_item_price',
-                        'median_item_price',
-                        'mean_order_freq',
-                        'median_order_freq',
-                        'unbiased_mean_price',
-                        'relative_price',
-                        'unbiased_client_specific_mean_price',
-                        'client_specific_relative_price'])
+    def load_data_for_model(cls, df: pl.DataFrame = None, keep_first_n_rows: int = None) -> pl.DataFrame:
+        # Handling the input
+        if df is None:
+            df = cls.load_all_data().pipe(cls.add_features())
+        if keep_first_n_rows is not None:
+            df = df[:keep_first_n_rows]
+        # Keep only relevant columns
+        df = df[['sales_net',
+                 'quantity',
+                 'order_channel',
+                 'quali_relation',
+                 'item_price',
+                 'mean_item_price',
+                 'median_item_price',
+                 'mean_order_freq',
+                 'median_order_freq',
+                 'unbiased_mean_price',
+                 'relative_price',
+                 'unbiased_client_specific_mean_price',
+                 'client_specific_relative_price',
+                 'days_with_order',
+                 'order_count',
+                 'q100_order_freq',
+                 'days_since_last_order',
+                 'churned']]
+        # Preprocess
+        numeric_cols = [df.columns[i] for i, t in enumerate(df.dtypes) if pl.datatypes.NumericType in t.mro()]
+        numeric_cols = [col for col in numeric_cols if col != 'churned']
+        df = cls.normalize(df, columns=numeric_cols)
+        cat_cols = ['order_channel', 'quali_relation']
+        df = cls.one_hot_encode(df, columns=cat_cols)
+        return df
+
+    @classmethod
+    def load_client_data_for_model(cls, df: pl.DataFrame, client_ids: Union[int, list[int]]) -> pl.DataFrame:
+        # To see all categories for the one-hot encoding, we need to have at least one record for each category
+        # (1217701 used all five order channels and is agreeable, 1365398 is difficult, 450600 is demanding (these would
+        # be the most data efficient ones) 188502 for online and difficult, 835089 for at the store and demanding,
+        # 1977896 for agreeable, 2086861 for by phone, 1421553 for during the visit of a sales rep, 1277522 for other (
+        # we have to use these, since the one-hot encoding is based on what categories are first found in the data)
+        if type(client_ids) == int:
+            client_ids = [client_ids]
+        necessary_ids = [188502, 835089, 1977896, 2086861, 1421553, 1277522]
+        df = df.filter(pl.col('client_id').is_in(necessary_ids + client_ids))
+        mask = df['client_id'].is_in(client_ids)
+        return cls.load_data_for_model(df).filter(mask).drop('churned')
+
+
+class PyTorchDataset(Dataset):
+    def __init__(self, df: pl.DataFrame = None, keep_first_n_rows: int = None) -> None:
+        df = DataPL.load_data_for_model(df, keep_first_n_rows=keep_first_n_rows)
+
+        self.X = df.drop(['churned'])
+        self.y = df[['churned']].to_numpy()
+
+    def __getitem__(self, item):
+        return self.X[item].to_numpy(), self.y[item]
+
+    def __len__(self):
+        return self.X.shape[0]
 
 
 class Analyzer:
@@ -278,6 +334,105 @@ class Plots:
             if file_name is None:
                 file_name = f'barplot_{x}_{y}.jpeg'
             plot.get_figure().savefig(file_name)
+
+
+class Models:
+    # Defining device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Defining hyper-parameters
+    num_epochs = 2
+    batch_size = 64
+    learning_rate = 10 ** -4
+    num_layers = 2
+
+    # Defining data shapes
+    num_classes = 1
+    input_size = 23
+    hidden_size = 128
+
+    # File name to save the model to
+    file_name = 'model.pth'
+
+    @classmethod
+    def create_rnn(cls, input_size: int = None, hidden_size: int = None, num_layers: int = None,
+                   num_classes: int = None) -> RNN:
+        # Handling the input
+        if input_size is None:
+            input_size = cls.input_size
+        if hidden_size is None:
+            hidden_size = cls.hidden_size
+        if num_layers is None:
+            num_layers = cls.num_layers
+        if num_classes is None:
+            num_classes = cls.num_classes
+
+        return RNN(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers,
+                   num_classes=num_classes).float()
+
+    @classmethod
+    def train_model(cls, model: Any, df: pl.DataFrame, learning_rate: float = None, num_epochs: int = None,
+                    batch_size: int = None, keep_first_n_rows: int = None,
+                    save: bool = True, file_name: str = None) -> Any:
+        # Handling input
+        if learning_rate is None:
+            learning_rate = cls.learning_rate
+        if num_epochs is None:
+            num_epochs = cls.num_epochs
+        if batch_size is None:
+            batch_size = cls.batch_size
+
+        criterion = nn.BCELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+        dataset = PyTorchDataset(df, keep_first_n_rows=keep_first_n_rows)
+        data_loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False)
+
+        n_steps = len(data_loader)
+
+        for epoch in range(num_epochs):
+            for i, (X, y) in enumerate(data_loader):
+                X = X.float().to(cls.device)
+                y = y.float().to(cls.device)
+
+                output = model(X)
+                loss = criterion(output, y)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                if (i + 1) % 100 == 0:
+                    print(f'Epoch {epoch + 1}/{num_epochs}, Step {i + 1}/{n_steps}, Loss: {loss.item():.4f}')
+        cls.model = model
+        if save:
+            if file_name is None:
+                file_name = cls.file_name
+            torch.save(model.stat_dict(), file_name)
+        return model
+
+    @classmethod
+    def load_model(cls, model_path: str = 'model.pth') -> Any:
+        model = cls.create_rnn()
+        model.load_state_dict(torch.load(model_path, map_location=cls.device))
+        model = model.to(cls.device)
+        return model.eval()
+
+    @classmethod
+    def predict(cls, X: torch.Tensor, model: Any = None) -> np.ndarray:
+        if model is None:
+            model = cls.model
+        if X.ndim == 2:
+            X = X.unsqueeze(0)
+
+        with torch.no_grad():
+            X = X.float().to(cls.device)
+            return model(X).numpy()
+
+    @classmethod
+    def predict_client(cls, client_ids: Union[int, list[int]], df: pl.DataFrame, model: Any = None) -> np.ndarray:
+        X = torch.from_numpy(DataPL.load_client_data_for_model(df, client_ids).to_numpy())
+        X = X.unsqueeze(0)
+        return cls.predict(X=X, model=model)
 
 
 # df = DataPL.load_all_data()
