@@ -2,5 +2,8 @@ matplotlib
 numpy
 pandas
 polars
+python_dateutil
+scikit_learn
 seaborn
 torch
+TPOT
