@@ -10,65 +10,27 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from rnns import RNN
+from .rnns import RNN
 
 import os
 from typing import Any, Union
-import warnings
-
-warnings.simplefilter('ignore', FutureWarning)
-
-# pl.Config.set_tbl_cols(2000)
-# pl.Config.set_tbl_rows(10)
 
 
 class Data:
+    normalization_basis: pl.DataFrame = None
+    one_hot_basis: pl.DataFrame = None
+
     @staticmethod
     def find_file(file_name: str) -> str:
         for root, folders, files in os.walk('.'):
             if file_name in files:
                 return root + '/' + file_name
 
-    @classmethod
-    def load_transactions(cls, file_path: str = None) -> pd.DataFrame:
-        if file_path is None:
-            file_path = cls.find_file('transaction_data.parquet')
-        df = pd.read_parquet(file_path)
-        # Don't use .loc here, since the garbage collector won't remove the copies
-        df[['date_order', 'date_invoice']] = df[['date_order', 'date_invoice']].astype('datetime64')
-        df[['quantity', 'client_id', 'product_id', 'branch_id']] = \
-            df[['quantity', 'client_id', 'product_id', 'branch_id']].astype('int32')
-        return df
-
-    @classmethod
-    def load_client_data(cls, file_path: str = None) -> pd.DataFrame:
-        if file_path is None:
-            file_path = cls.find_file('sales_client_relationship_dataset.csv')
-        df = pd.read_csv(file_path)
-        df['client_id'] = df['client_id'].astype('int32')
-        return df
-
-    @classmethod
-    def load_all_data(cls, transactions_file: str = None, client_file: str = None) -> pd.DataFrame:
-        return pd.merge(cls.load_transactions(transactions_file), cls.load_client_data(client_file),
-                        on='client_id', how='inner')
-
     @staticmethod
-    def clean_data(df: pd.DataFrame) -> pd.DataFrame:
-        return df[df['sales_net'] > 0]
-
-    @staticmethod
-    def calculate_item_price(df: pd.DataFrame) -> pd.DataFrame:
-        df['item_price'] = df['sales_net'] / df['quantity']
-        return df
-
-
-class DataPL:
-    @staticmethod
-    def find_file(file_name: str) -> str:
+    def find_folder(folder: str) -> str:
         for root, folders, files in os.walk('.'):
-            if file_name in files:
-                return root + '/' + file_name
+            if folder in root:
+                return root
 
     @classmethod
     def load_transactions(cls, file_path: str = None) -> pl.DataFrame:
@@ -91,18 +53,43 @@ class DataPL:
         return df
 
     @classmethod
-    def load_all_data(cls, transactions_file: str = None, client_file: str = None, clean: bool = True) -> pl.DataFrame:
+    def load_all_data(cls, transactions_file: str = None, client_file: str = None, clean: bool = True,
+                      order: bool = True, add_index: bool = True, add_range: bool = True) -> pl.DataFrame:
         df_merged = cls.load_transactions(transactions_file).join(cls.load_client_data(client_file),
                                                                   on='client_id', how='inner')
         if clean:
             df_merged = cls.clean_data(df_merged)
+        if order:
+            df_merged = cls.order_data(df_merged)
+        if add_index:
+            df_merged = cls.add_index(df_merged)
+        if add_range:
+            df_merged = cls.add_range(df_merged)
         return df_merged
+
+    @classmethod
+    def order_data(cls, df: pl.DataFrame) -> pl.DataFrame:
+        return df.sort(by=['client_id', 'date_order', 'product_id'])
 
     @staticmethod
     def clean_data(df: pl.DataFrame) -> pl.DataFrame:
-        return df.filter((pl.col('sales_net') > 0)
-                         & (pl.col('date_invoice') >= pl.col('date_order'))
-                         & (pl.col('date_order').n_unique().over('client_id') > 1))
+        sales_c = pl.col('sales_net') > 0
+        date_c = pl.col('date_invoice') >= pl.col('date_order')
+        order_c = pl.col('date_order').n_unique().over('client_id') > 1
+        # Since the filter by one condition is executed independent of the other conditions, we have to chain the last
+        # one
+        return df.filter(sales_c & date_c).filter(order_c)
+
+    @staticmethod
+    def add_index(df: pl.DataFrame) -> pl.DataFrame:
+        return df.with_columns(pl.Series(name='index', values=np.arange(len(df))))
+
+    @classmethod
+    def add_range(cls, df: pl.DataFrame) -> pl.DataFrame:
+        if 'index' not in df.columns:
+            df = cls.add_index(df)
+        return df.with_columns([pl.col('index').first().alias('first').over('client_id'),
+                                pl.col('index').last().alias('last').over('client_id')])
 
     @staticmethod
     def calculate_item_price(df: pl.DataFrame) -> pl.DataFrame:
@@ -204,79 +191,86 @@ class DataPL:
             .pipe(cls.calculate_quantile_order_freq, quantile=1, col_name='q100_order_freq') \
             .pipe(cls.add_churn, threshold=1.5)
 
-    @staticmethod
-    def normalize(df: pl.DataFrame, columns: list[Union[str, int]]) -> pl.DataFrame:
-        return df.with_columns([pl.col(col) / pl.max(col) for col in columns])
+    @classmethod
+    def create_normalization_basis(cls, df: pl.DataFrame, columns: list[str], save: bool = False) -> pl.DataFrame:
+        normalization_basis = df[columns].max()
+        if save:
+            cls.normalization_basis = normalization_basis
+        return normalization_basis
 
-    @staticmethod
-    def one_hot_encode(df: pl.DataFrame, columns: list[Union[str, int]]) -> pl.DataFrame:
+    @classmethod
+    def normalize(cls, df: pl.DataFrame, columns: list[Union[str, int]]) -> pl.DataFrame:
+        if cls.normalization_basis is None:
+            cls.create_normalization_basis(df, columns=columns, save=True)
+        return df.with_columns([pl.col(col) / cls.normalization_basis[col][0] for col in columns])
+
+    @classmethod
+    def create_one_hot_basis(cls, df: pl.DataFrame, columns: list[str], save: bool = False) -> pl.DataFrame:
+        bases = []
+        for column in columns:
+            bases.append(df[df.groupby(column).agg(pl.col('index').first())['index']])
+        one_hot_basis = pl.concat(bases, how='vertical')
+        if save:
+            cls.one_hot_basis = one_hot_basis
+        return one_hot_basis
+
+    @classmethod
+    def one_hot_encode(cls, df: pl.DataFrame, columns: list[Union[str, int]]) -> pl.DataFrame:
         # index_cols = [col for col in df.columns if col not in columns]
         # df.with_columns(pl.lit(1).alias('one').cast(pl.Int8)) \
         #     .pivot(index=index_cols, columns=columns, values='one') \
         #     .fill_null(0)
-        return df.to_dummies(columns=columns)
+        if cls.one_hot_basis is None:
+            cls.create_one_hot_basis(df, columns=columns, save=True)
+        # Since we return the data without the one_hot_basis, rechunking is not needed which saves time
+        df = pl.concat([cls.one_hot_basis, df], how='vertical', rechunk=False)
+        return df.to_dummies(columns=columns)[len(cls.one_hot_basis):]
 
     @classmethod
-    def load_data_for_model(cls, df: pl.DataFrame = None, keep_first_n_rows: int = None) -> pl.DataFrame:
+    def load_data_for_model(cls, df: pl.DataFrame = None, keep_first_n_clients: int = None) -> pl.DataFrame:
         # Handling the input
         if df is None:
-            df = cls.load_all_data().pipe(cls.add_features())
-        if keep_first_n_rows is not None:
-            df = df[:keep_first_n_rows]
-        # Keep only relevant columns
-        df = df[['sales_net',
-                 'quantity',
-                 'order_channel',
-                 'quali_relation',
-                 'item_price',
-                 'mean_item_price',
-                 'median_item_price',
-                 'mean_order_freq',
-                 'median_order_freq',
-                 'unbiased_mean_price',
-                 'relative_price',
-                 'unbiased_client_specific_mean_price',
-                 'client_specific_relative_price',
-                 'days_with_order',
-                 'order_count',
-                 'q100_order_freq',
-                 'days_since_last_order',
-                 'churned']]
-        # Preprocess
+            df = cls.load_all_data().pipe(cls.add_features)
+        # Defining the numerical and categorical columns
         numeric_cols = [df.columns[i] for i, t in enumerate(df.dtypes) if pl.datatypes.NumericType in t.mro()]
-        numeric_cols = [col for col in numeric_cols if col != 'churned']
-        df = cls.normalize(df, columns=numeric_cols)
+        not_to_scale = ['index', 'first', 'last', 'client_id', 'product_id', 'branch_id', 'churned']
+        numeric_cols = [col for col in numeric_cols if col not in not_to_scale]
         cat_cols = ['order_channel', 'quali_relation']
-        df = cls.one_hot_encode(df, columns=cat_cols)
-        return df
 
-    @classmethod
-    def load_client_data_for_model(cls, df: pl.DataFrame, client_ids: Union[int, list[int]]) -> pl.DataFrame:
-        # To see all categories for the one-hot encoding, we need to have at least one record for each category
-        # (1217701 used all five order channels and is agreeable, 1365398 is difficult, 450600 is demanding (these would
-        # be the most data efficient ones) 188502 for online and difficult, 835089 for at the store and demanding,
-        # 1977896 for agreeable, 2086861 for by phone, 1421553 for during the visit of a sales rep, 1277522 for other (
-        # we have to use these, since the one-hot encoding is based on what categories are first found in the data)
-        if type(client_ids) == int:
-            client_ids = [client_ids]
-        necessary_ids = [188502, 835089, 1977896, 2086861, 1421553, 1277522]
-        df = df.filter(pl.col('client_id').is_in(necessary_ids + client_ids))
-        mask = df['client_id'].is_in(client_ids)
-        return cls.load_data_for_model(df).filter(mask).drop('churned')
+        if keep_first_n_clients is not None:
+            first_n_clients = df['client_id'].unique()[:keep_first_n_clients]
+            # This makes sure that the scaling will be consistent. You can think of it as the .fit in scikit-learn
+            cls.create_normalization_basis(df=df, columns=numeric_cols, save=True)
+            # This makes sure that the encoding will be done along all categories. You can think of it as the .fit in
+            # scikit-learn
+            cls.create_one_hot_basis(df=df, columns=cat_cols, save=True)
+            df = df.filter(pl.col('client_id').is_in(first_n_clients))
+            df = cls.order_data(df)
+
+        # Preprocess
+        df = cls.one_hot_encode(df, columns=cat_cols)
+        df = cls.normalize(df, columns=numeric_cols)
+        # We can drop the columns that we don't need anymore
+        df = df.drop(['index', 'date_order', 'date_invoice', 'product_id', 'branch_id', 'client_id'])
+        return df
 
 
 class PyTorchDataset(Dataset):
-    def __init__(self, df: pl.DataFrame = None, keep_first_n_rows: int = None) -> None:
-        df = DataPL.load_data_for_model(df, keep_first_n_rows=keep_first_n_rows)
-
+    def __init__(self, df: pl.DataFrame = None, keep_first_n_clients: int = None) -> None:
+        self.ranges = df.groupby('client_id').agg([pl.col('first').first(),
+                                                   pl.col('last').first()]).sort(by='client_id')
+        self.ranges = self.ranges[:keep_first_n_clients]
+        df = Data.load_data_for_model(df, keep_first_n_clients=keep_first_n_clients)
+        df = df.drop(['first', 'last'])
         self.X = df.drop(['churned'])
-        self.y = df[['churned']].to_numpy()
+        self.y = df[['churned']]
 
     def __getitem__(self, item):
-        return self.X[item].to_numpy(), self.y[item]
+        return (self.X[self.ranges[item, 'first']: self.ranges[item, 'last'] + 1].to_numpy(),
+                self.y[self.ranges[item, 'first']].to_numpy())
 
     def __len__(self):
-        return self.X.shape[0]
+        return len(self.ranges)
 
 
 class Analyzer:
@@ -341,7 +335,7 @@ class Models:
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Defining hyper-parameters
     num_epochs = 2
-    batch_size = 64
+    batch_size = 8
     learning_rate = 10 ** -4
     num_layers = 2
 
@@ -371,7 +365,7 @@ class Models:
 
     @classmethod
     def train_model(cls, model: Any, df: pl.DataFrame, learning_rate: float = None, num_epochs: int = None,
-                    batch_size: int = None, keep_first_n_rows: int = None,
+                    batch_size: int = None, keep_first_n_clients: int = None,
                     save: bool = True, file_name: str = None) -> Any:
         # Handling input
         if learning_rate is None:
@@ -384,7 +378,7 @@ class Models:
         criterion = nn.BCELoss()
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
-        dataset = PyTorchDataset(df, keep_first_n_rows=keep_first_n_rows)
+        dataset = PyTorchDataset(df, keep_first_n_clients=keep_first_n_clients)
         data_loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False)
 
         n_steps = len(data_loader)
@@ -393,9 +387,8 @@ class Models:
             for i, (X, y) in enumerate(data_loader):
                 X = X.float().to(cls.device)
                 y = y.float().to(cls.device)
-
                 output = model(X)
-                loss = criterion(output, y)
+                loss = criterion(output.unsqueeze(0), y)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -407,13 +400,14 @@ class Models:
         if save:
             if file_name is None:
                 file_name = cls.file_name
-            torch.save(model.stat_dict(), file_name)
+            torch.save(model.state_dict(), file_name)
         return model
 
     @classmethod
-    def load_model(cls, model_path: str = 'model.pth') -> Any:
+    def load_model(cls, file_name: str = 'model.pth') -> Any:
         model = cls.create_rnn()
-        model.load_state_dict(torch.load(model_path, map_location=cls.device))
+        file_path = Data.find_file(file_name=file_name)
+        model.load_state_dict(torch.load(file_path, map_location=cls.device))
         model = model.to(cls.device)
         return model.eval()
 
@@ -429,11 +423,22 @@ class Models:
             return model(X).numpy()
 
     @classmethod
-    def predict_client(cls, client_ids: Union[int, list[int]], df: pl.DataFrame, model: Any = None) -> np.ndarray:
-        X = torch.from_numpy(DataPL.load_client_data_for_model(df, client_ids).to_numpy())
-        X = X.unsqueeze(0)
-        return cls.predict(X=X, model=model)
+    def predict_clients(cls, client_ids: Union[int, list[int]], df: pl.DataFrame, model: Any = None) -> list[float]:
+        """This method can be used to make predictions on specific clients."""
+        if type(client_ids) == int:
+            client_ids = [client_ids]
+        if model is None:
+            model = cls.model
 
+        ranges = df.groupby('client_id').agg([pl.col('first').first(),
+                                              pl.col('last').first()]).sort(by='client_id')
+        df = Data.load_data_for_model(df)
+        df = df.drop(['first', 'last'])
+        X = df.drop(['churned'])
 
-# df = DataPL.load_all_data()
-# df = DataPL.add_features(df)
+        predictions = []
+        for client_id in client_ids:
+            index = ranges.filter(pl.col('client_id') == client_id)
+            predictions.append(cls.predict(X=torch.from_numpy(X[index['first'][0]: index['last'][0] + 1].to_numpy()),
+                                           model=model).item())
+        return predictions

@@ -12,7 +12,11 @@
 data/
 Data/
 
-#IDE specific folders
+# IDE specific folders
 .idea/
 .DS_Store
 __pycache__/
+
+# Distribution files
+build/
+*egg-info/
